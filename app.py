@@ -126,6 +126,21 @@ def summarize(question: str, sql: str, rows) -> str:
     return call_openai([{"role": "system", "content": system}, {"role": "user", "content": user}]).strip()
 
 
+def line_push(user_id: str, text: str) -> None:
+    if not LINE_CHANNEL_ACCESS_TOKEN or not user_id:
+        print("Missing LINE token or user_id")
+        return
+
+    url = "https://api.line.me/v2/bot/message/push"
+    headers = {
+        "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    payload = {"to": user_id, "messages": [{"type": "text", "text": text[:5000]}]}
+    resp = requests.post(url, headers=headers, json=payload, timeout=15)
+    print("LINE push:", resp.status_code, resp.text[:200])
+
+
 @app.post("/line/webhook")
 async def line_webhook(req: Request):
     body = await req.json()
@@ -137,18 +152,18 @@ async def line_webhook(req: Request):
 
     evt = events[0]
     reply_token = evt.get("replyToken") or evt.get("reply_token") or ""
-    # LINE 原始事件通常在 message.text
-    text = ""
+
+    # 取得 userId（Push 需要）
+    source = evt.get("source") or {}
+    user_id = source.get("userId") or evt.get("user_id") or ""
+
     msg = evt.get("message") or {}
-    if isinstance(msg, dict):
-        text = (msg.get("text") or "").strip()
-    if not text:
-        text = (evt.get("text") or "").strip()
+    text = (msg.get("text") or "").strip()
 
     if not reply_token or not text:
         return {"ok": True}
 
-    # 先回覆避免 token 過期
+    # 1) 先用 reply token 回「收到」
     line_reply(reply_token, "收到，查詢中…")
 
     try:
@@ -156,7 +171,11 @@ async def line_webhook(req: Request):
         sql = validate_sql(sql)
         rows = run_sql_via_pa(sql)
         answer = summarize(text, sql, rows)
-        line_reply(reply_token, answer)
+
+        # 2) 這裡改用 push（不要再用 reply_token）
+        line_push(user_id, answer)
+
     except Exception as e:
-        line_reply(reply_token, f"查詢失敗：{type(e).__name__}\n{str(e)[:350]}")
+        line_push(user_id, f"查詢失敗：{type(e).__name__}\n{str(e)[:350]}")
+
     return {"ok": True}
