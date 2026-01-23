@@ -209,6 +209,26 @@ def summarize_locally(question: str, sql: str, rows) -> str:
     return "\n".join(lines)[:4500]
 
 
+# ===== Dedup (POC: in-memory) =====
+PROCESSED = {}  # key -> timestamp
+DEDUP_TTL_SECONDS = 15 * 60  # 15 min
+
+def _cleanup_processed(now: float):
+    # 清掉太舊的 key，避免記憶體一直長
+    old_keys = [k for k, ts in PROCESSED.items() if now - ts > DEDUP_TTL_SECONDS]
+    for k in old_keys:
+        PROCESSED.pop(k, None)
+
+def is_duplicate(event_key: str) -> bool:
+    now = time.time()
+    _cleanup_processed(now)
+    if event_key in PROCESSED:
+        return True
+    PROCESSED[event_key] = now
+    return False
+
+
+
 # =========================
 # LINE Webhook
 # =========================
@@ -241,6 +261,17 @@ async def line_webhook(req: Request):
 
     if not reply_token or not text:
         return {"ok": True}
+
+    # 取 message id 當 dedup key（若沒有就用 replyToken + timestamp 組合）
+    msg = evt.get("message") or {}
+    msg_id = (msg.get("id") or "").strip()
+    ts = str(evt.get("timestamp") or "")
+    dedup_key = msg_id or f"{reply_token}:{ts}"
+
+    if is_duplicate(dedup_key):
+        print("Duplicate event, skip:", dedup_key)
+        return {"ok": True}
+
 
     # 1) immediate reply
     line_reply(reply_token, "收到，查詢中…")
