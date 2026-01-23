@@ -147,6 +147,37 @@ def validate_sql(sql: str) -> str:
 
     return s
 
+def summarize_with_llm(question: str, sql: str, rows: list[dict]) -> str:
+    """
+    用 LLM 把 SQL 結果寫成自然中文回答（避免模板感）
+    - 只餵前 N 筆（避免 token 太大）
+    """
+    # 避免 rows 太大爆 token：只取前 15 筆
+    preview_rows = rows[:15]
+
+    system = (
+        "你是企業內部品質/製造數據助理。"
+        "請用自然、口語但專業的繁體中文回答。"
+        "回答要：1) 先一句話結論 2) 再列出重點數據(條列) 3) 如有不確定(例如欄位缺失/資料不足)要說明。"
+        "不要提到你是AI，不要貼出SQL全文，除非使用者要求。"
+        "數字盡量加上單位/百分比並四捨五入。"
+        "若 rows 很少或為空，請直接說查不到資料並給可能原因。"
+    )
+
+    user = {
+        "question": question,
+        "sql_preview": sql[:600],        # 不要太長，避免它照抄
+        "rows_preview": preview_rows     # 給它看資料
+    }
+
+    content = call_openai([
+        {"role": "system", "content": system},
+        {"role": "user", "content": json.dumps(user, ensure_ascii=False)}
+    ])
+
+    return content.strip()[:4500]
+
+
 
 # =========================
 # Call Power Automate SQL Runner
@@ -282,7 +313,11 @@ async def line_webhook(req: Request):
         rows = run_sql_via_pa(sql)
 
         # local summary to avoid second OpenAI call (reduce 429 risk)
-        answer = summarize_locally(text, sql, rows)
+        # answer = summarize_locally(text, sql, rows)
+
+        # Summarize answer with llm
+        answer = summarize_with_llm(text, sql, rows)
+
 
         # 2) push result
         line_push(user_id, answer)
