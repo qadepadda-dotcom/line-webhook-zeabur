@@ -1,61 +1,34 @@
 import os
+import re
 import json
 import requests
 from fastapi import FastAPI, Request
 
 app = FastAPI()
 
+# ===== Env =====
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+PA_SQL_RUNNER_URL = os.getenv("PA_SQL_RUNNER_URL", "")
 
-# ---- 基本檢查 ----
+# ===== Safety rails =====
+ALLOWED_FROM = [
+    "dbo.cqcr310",      # 先用你已驗證 OK 的
+    # "erp.cqcr310",    # 之後如果 SQL endpoint 這樣命名再加
+]
+BANNED_SQL = re.compile(r"\b(insert|update|delete|drop|alter|create|truncate|merge)\b", re.IGNORECASE)
+
+# ===== Utils =====
 @app.get("/health")
 def health():
     return {"ok": True}
 
 
-# ---- OpenAI Chat Completions ----
-def call_openai_chat(user_text: str) -> str:
-    """
-    Calls OpenAI Chat Completions API and returns assistant message.
-    Docs: https://platform.openai.com/docs/api-reference/chat
-    """
-    if not OPENAI_API_KEY:
-        return "尚未設定 OPENAI_API_KEY，因此目前無法呼叫 GPT。"
-
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    system_prompt = (
-        "你是企業品保/BI 助理。回答要用繁體中文、簡潔、可執行。"
-        "如果使用者問的是公司內部 ERP/Fabric 數據，但你沒有拿到查詢結果，"
-        "請明確說「目前尚未連接資料源，因此無法提供實際數據」，不要猜數字。"
-    )
-
-    payload = {
-        "model": OPENAI_MODEL,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_text},
-        ],
-        "temperature": 0.2,
-        "max_tokens": 400,
-    }
-
-    r = requests.post(url, headers=headers, json=payload, timeout=40)
-    r.raise_for_status()
-    data = r.json()
-    return data["choices"][0]["message"]["content"]
-
-
-# ---- LINE Reply API ----
 def line_reply(reply_token: str, text: str) -> None:
-    if not LINE_CHANNEL_ACCESS_TOKEN:
-        # 沒 token 就只能吞掉（避免 webhook 500）
+    """Reply message via LINE Reply API"""
+    if not LINE_CHANNEL_ACCESS_TOKEN or not reply_token:
+        print("Missing LINE token or reply_token")
         return
 
     url = "https://api.line.me/v2/bot/message/reply"
@@ -63,74 +36,127 @@ def line_reply(reply_token: str, text: str) -> None:
         "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
         "Content-Type": "application/json",
     }
+    payload = {"replyToken": reply_token, "messages": [{"type": "text", "text": text[:5000]}]}
+    resp = requests.post(url, headers=headers, json=payload, timeout=15)
+    print("LINE reply:", resp.status_code, resp.text[:200])
+
+
+def call_openai(messages):
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY not set")
+
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
     payload = {
-        "replyToken": reply_token,
-        "messages": [{"type": "text", "text": text[:5000]}],  # LINE 文字長度限制保守處理
+        "model": OPENAI_MODEL,
+        "messages": messages,
+        "temperature": 0.0,
+        "max_tokens": 650,
     }
-    requests.post(url, headers=headers, json=payload, timeout=15)
+    r = requests.post(url, headers=headers, json=payload, timeout=60)
+    r.raise_for_status()
+    return r.json()["choices"][0]["message"]["content"]
 
 
-def looks_like_data_question(text: str) -> bool:
+def generate_sql(question: str) -> str:
     """
-    粗略判斷：像是在問 ERP/Fabric 查詢的問題（之後會改成更完整的意圖分類）
+    NL (Chinese) -> SQL
+    Output only SQL. No markdown. No explanation.
+    Target: SQL Server compatible syntax.
     """
-    keywords = [
-        "近", "最近", "30天", "7天", "本月", "上月",
-        "NG", "不良", "IQC", "檢驗", "廠別", "昆山", "增達",
-        "Top", "排名", "最多", "趨勢", "比例", "良率", "不良率",
-        "cqcr310", "lakehouse", "fabric", "sql"
-    ]
-    t = (text or "").lower()
-    return any(k.lower() in t for k in keywords)
+    system = (
+        "你是企業資料庫的 SQL 產生器。"
+        "只輸出一段可執行 SQL（不要解釋、不要 markdown）。"
+        "限制：只允許 SELECT。"
+        f"FROM 只能使用以下白名單：{', '.join(ALLOWED_FROM)}。"
+        "如果要近30天，請用 SQL Server 語法：WHERE Inspection_Date >= DATEADD(day,-30, CAST(GETDATE() AS date))。"
+        "預設加上 TOP 50 限制避免資料過大。"
+        "欄位已知：Plant, Inspection_Date, Product_Number, Product_Name, Supplier_Short_Name, "
+        "Inspection_Item_Defect_Cause, Submitted_Quantity, Defect_Quantity, Sample_Size, Inspection_Result, Receiving_Number, Remark。"
+        "常見需求：NG率=SUM(Defect_Quantity)/NULLIF(SUM(Submitted_Quantity),0)。"
+    )
+    user = f"問題：{question}\n請輸出 SQL："
+    sql = call_openai([{"role": "system", "content": system}, {"role": "user", "content": user}]).strip()
+    return sql
 
 
-# ---- LINE Webhook ----
+def validate_sql(sql: str) -> str:
+    s = sql.strip().strip(";")
+    if not s.lower().startswith("select"):
+        raise ValueError("只允許 SELECT")
+    if BANNED_SQL.search(s):
+        raise ValueError("偵測到禁止的 SQL 關鍵字")
+
+    ok = any(re.search(rf"\bfrom\s+{re.escape(t)}\b", s, re.IGNORECASE) for t in ALLOWED_FROM)
+    if not ok:
+        raise ValueError("FROM 來源不在白名單中")
+
+    return s
+
+
+def run_sql_via_pa(sql: str):
+    if not PA_SQL_RUNNER_URL:
+        raise RuntimeError("PA_SQL_RUNNER_URL not set")
+
+    payload = {"sql": sql, "top": 50}
+    r = requests.post(PA_SQL_RUNNER_URL, json=payload, timeout=90)
+    if r.status_code >= 400:
+        raise RuntimeError(f"PA runner error {r.status_code}: {r.text[:500]}")
+    data = r.json()
+    rows = data.get("rows", [])
+    return rows
+
+
+def summarize(question: str, sql: str, rows) -> str:
+    """
+    Chinese summary grounded on rows only.
+    """
+    system = (
+        "你是品質/製造數據分析助理。"
+        "你只能根據提供的 rows 回答，不可以臆測沒有的數字。"
+        "回答請用繁體中文，先給結論，再條列重點。"
+        "如果 rows 為空，請回覆：查無資料，並列出可能原因（例如：篩選條件太嚴格、日期範圍沒有資料）。"
+        "回答長度控制在 6~10 行內。"
+    )
+    user = (
+        f"問題：{question}\n"
+        f"SQL：{sql}\n"
+        f"rows(JSON，最多50筆)：\n{json.dumps(rows, ensure_ascii=False)[:12000]}"
+    )
+    return call_openai([{"role": "system", "content": system}, {"role": "user", "content": user}]).strip()
+
+
 @app.post("/line/webhook")
 async def line_webhook(req: Request):
-    """
-    Expected body (from your Zeabur/PA forwarding):
-    {
-      "events": [
-        {
-          "reply_token": "...",
-          "text": "hello",
-          ...
-        }
-      ]
-    }
-    """
-    try:
-        body = await req.json()
-    except Exception:
-        return {"ok": True}
+    body = await req.json()
+    print("LINE webhook received:", json.dumps(body, ensure_ascii=False)[:500])
 
     events = body.get("events", [])
     if not events:
         return {"ok": True}
 
     evt = events[0]
-    reply_token = evt.get("reply_token", "")
-    user_text = evt.get("text", "") or ""
+    reply_token = evt.get("replyToken") or evt.get("reply_token") or ""
+    # LINE 原始事件通常在 message.text
+    text = ""
+    msg = evt.get("message") or {}
+    if isinstance(msg, dict):
+        text = (msg.get("text") or "").strip()
+    if not text:
+        text = (evt.get("text") or "").strip()
 
-    # 沒有 reply_token 就無法 reply（例如某些 verify/ping）
-    if not reply_token:
+    if not reply_token or not text:
         return {"ok": True}
 
-    # POC：尚未接 SQL 的情況下，遇到「看起來是查數據」的問題，先誠實回覆
-    if looks_like_data_question(user_text):
-        msg = (
-            "我目前還沒接上 Fabric/Lakehouse SQL，所以無法直接查出實際數據。\n"
-            "但我可以先幫你把這句話轉成「可查的 SQL 需求」或「要的指標/篩選條件」。\n\n"
-            f"你問的是：{user_text}"
-        )
-        line_reply(reply_token, msg)
-        return {"ok": True}
+    # 先回覆避免 token 過期
+    line_reply(reply_token, "收到，查詢中…")
 
-    # 一般問題：直接用 GPT 回答
     try:
-        answer = call_openai_chat(user_text)
+        sql = generate_sql(text)
+        sql = validate_sql(sql)
+        rows = run_sql_via_pa(sql)
+        answer = summarize(text, sql, rows)
+        line_reply(reply_token, answer)
     except Exception as e:
-        answer = f"GPT 呼叫失敗：{type(e).__name__}"
-
-    line_reply(reply_token, answer)
+        line_reply(reply_token, f"查詢失敗：{type(e).__name__}\n{str(e)[:350]}")
     return {"ok": True}
