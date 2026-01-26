@@ -27,6 +27,117 @@ ALLOWED_FROM = [
 BANNED_SQL = re.compile(r"\b(insert|update|delete|drop|alter|create|truncate|merge)\b", re.IGNORECASE)
 
 
+
+# =========================
+# Plant normalization
+# =========================
+PLANT_ALIAS = {
+    "越南": ["越南", "vietnam", "VN", "vn", "越廠", "越南廠"],
+    "昆山": ["昆山", "KS", "AK", "ks", "昆山廠"],
+    "增達": ["增達", "ZD", "zd", "增達廠"],
+}
+
+# reverse map alias(lowered) -> cn
+ALIAS_TO_CN = {}
+for cn, aliases in PLANT_ALIAS.items():
+    for a in aliases:
+        ALIAS_TO_CN[a.strip().lower()] = cn
+
+
+def normalize_plant_from_text(text: str) -> str | None:
+    """Try find plant from user question text."""
+    if not text:
+        return None
+    t = text.strip().lower()
+    # exact alias match by containment
+    for alias, cn in ALIAS_TO_CN.items():
+        if alias and alias in t:
+            return cn
+    return None
+
+
+def normalize_plant_value(raw: str) -> str | None:
+    """Normalize a single plant value (from SQL literal) to CN."""
+    if raw is None:
+        return None
+    v = str(raw).strip().strip('"').strip("'").strip()
+    if not v:
+        return None
+    key = v.lower()
+    key = key.replace("  ", " ").strip()
+    key = key.replace("viet-nam", "vietnam").replace("viet nam", "viet nam")
+    # direct match (cn values)
+    if v in PLANT_ALIAS:
+        return v
+    # alias match
+    if key in ALIAS_TO_CN:
+        return ALIAS_TO_CN[key]
+    return None
+
+
+def enforce_plant_in_sql(sql: str, plant_cn: str | None) -> str:
+    """
+    Force Plant filter to use Chinese values in SQL.
+    - If plant_cn provided (from user question), it overrides SQL's plant.
+    - If SQL has Plant='Vietnam' etc, normalize to CN.
+    - Supports "=" and "IN (...)"
+    """
+    if not sql:
+        return sql
+
+    original = sql
+
+    # 1) Replace Plant = 'xxx'
+    def repl_eq(m: re.Match):
+        left = m.group(1)  # Plant or [Plant] etc (keep)
+        quote = m.group(2)
+        val = m.group(3)
+        cn = plant_cn or normalize_plant_value(val) or val
+        # SQL Server unicode literal
+        return f"{left} = N'{cn}'"
+
+    eq_pattern = re.compile(r"(\bPlant\b|\[Plant\]|\`Plant\`)\s*=\s*(['\"])([^'\"]+)\2", re.IGNORECASE)
+    sql = eq_pattern.sub(repl_eq, sql)
+
+    # 2) Replace Plant IN ('a','b',...)
+    def repl_in(m: re.Match):
+        left = m.group(1)
+        inside = m.group(2)
+        # split by comma, keep simple parsing
+        parts = [p.strip() for p in inside.split(",")]
+        new_vals = []
+        for p in parts:
+            pv = p.strip().strip("'").strip('"').strip()
+            cn = plant_cn or normalize_plant_value(pv) or pv
+            new_vals.append(f"N'{cn}'")
+        return f"{left} IN ({', '.join(new_vals)})"
+
+    in_pattern = re.compile(r"(\bPlant\b|\[Plant\]|\`Plant\`)\s+IN\s*\(([^)]+)\)", re.IGNORECASE)
+    sql = in_pattern.sub(repl_in, sql)
+
+    # 3) If user asked for a plant, but SQL has no plant filter -> inject it
+    if plant_cn:
+        has_plant_filter = re.search(r"(\bPlant\b|\[Plant\]|\`Plant\`)\s*(=|IN)\s*", sql, re.IGNORECASE) is not None
+        if not has_plant_filter:
+            # insert before GROUP BY / ORDER BY if exists, else append
+            inject = f" Plant = N'{plant_cn}' "
+            if re.search(r"\bWHERE\b", sql, re.IGNORECASE):
+                # add AND before GROUP/ORDER
+                sql = re.sub(r"\b(GROUP\s+BY|ORDER\s+BY)\b", rf"AND{inject}\n\1", sql, flags=re.IGNORECASE, count=1)
+                if sql == original:
+                    sql = sql.rstrip().rstrip(";") + f"\nAND{inject};"
+            else:
+                # add WHERE before GROUP/ORDER
+                sql = re.sub(r"\b(GROUP\s+BY|ORDER\s+BY)\b", rf"WHERE{inject}\n\1", sql, flags=re.IGNORECASE, count=1)
+                if sql == original:
+                    sql = sql.rstrip().rstrip(";") + f"\nWHERE{inject};"
+
+    if sql != original:
+        print("SQL plant normalized.")
+    return sql
+
+
+
 # =========================
 # Basic endpoints
 # =========================
@@ -109,19 +220,24 @@ def call_openai(messages):
     raise RuntimeError("OpenAI rate limited (429). Please try again later.")
 
 
+
 # =========================
 # NL -> SQL
 # =========================
+def strip_code_fence(s: str) -> str:
+    s = s.strip()
+    s = re.sub(r"^```[a-zA-Z0-9]*\s*", "", s)
+    s = re.sub(r"\s*```$", "", s)
+    return s.strip()
+
+
 def generate_sql(question: str) -> str:
-    """
-    Chinese NL -> SQL Server SQL
-    Output only SQL. No markdown.
-    """
     system = (
         "你是企業資料庫的 SQL 產生器。"
         "只輸出一段可執行 SQL（不要解釋、不要 markdown）。"
         "限制：只允許 SELECT。"
         f"FROM 只能使用以下白名單：{', '.join(ALLOWED_FROM)}。"
+        "請特別注意：dbo.cqcr310 的 Plant 欄位資料值為中文（越南/昆山/增達），請在 SQL 中使用中文廠別。"
         "若要近30天，請使用 SQL Server 語法：WHERE Inspection_Date >= DATEADD(day,-30, CAST(GETDATE() AS date))。"
         "預設加上 TOP 50 限制避免資料過大。"
         "欄位已知：Plant, Inspection_Date, Product_Number, Product_Name, Supplier_Short_Name, "
@@ -131,6 +247,7 @@ def generate_sql(question: str) -> str:
     )
     user = f"問題：{question}\n請輸出 SQL："
     sql = call_openai([{"role": "system", "content": system}, {"role": "user", "content": user}]).strip()
+    sql = strip_code_fence(sql)
     return sql.strip().strip(";")
 
 
