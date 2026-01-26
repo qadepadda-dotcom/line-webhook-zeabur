@@ -145,8 +145,8 @@ def enforce_plant_in_sql(sql: str, plant_cn: str | None) -> str:
 DEFECT_ALIAS = {
     "驗退": ["驗退", "判退"],
     "特採": ["特採"],
-    # Assuming '允收' is a valid value for accepted
-    "允收": ["允收", "ok", "accept"],
+    # '合格' is the main value for accepted
+    "合格": ["合格", "ok", "accept", "允收"],
 }
 
 # Special group alias for "defect" which maps to multiple values
@@ -287,7 +287,7 @@ def generate_sql(question: str) -> str:
         "若要近30天，請使用 SQL Server 語法：WHERE Inspection_Date >= DATEADD(day,-30, CAST(GETDATE() AS date))。"
         "欄位已知：Plant, Inspection_Date, Product_Number, Product_Name, Supplier_Short_Name, "
         "Inspection_Item_Defect_Cause, Submitted_Quantity, Defect_Quantity, Sample_Size, Inspection_Result, Receiving_Number, Remark。"
-        "常見需求：NG率=SUM(Defect_Quantity)/NULLIF(SUM(Submitted_Quantity),0)。"
+        "常見需求：不良批率、NG率= NULLIF(不良批,0)/NULLIF(檢驗批,0)。「批」的計算方式是 COUNT(Receiving_Number)。例如「檢驗批」= COUNT(Receiving_Number)，「不良批」= COUNT(CASE WHEN Inspection_Result IN ('特採', '驗退') THEN Receiving_Number END)。"
         "請優先回傳可用於管理者查看的 Top N 結果（ORDER BY ... DESC）。"
     )
     user = f"問題：{question}\n請輸出 SQL："
