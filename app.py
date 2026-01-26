@@ -137,6 +137,52 @@ def enforce_plant_in_sql(sql: str, plant_cn: str | None) -> str:
     return sql
 
 
+# =========================
+# Defect normalization
+# =========================
+# "不良" (defect) includes "特採" (special acceptance) and "驗退" (rejection).
+# Per user: 不良=特採&驗退, 驗退=判退, 不良=NG
+DEFECT_ALIAS = {
+    "驗退": ["驗退", "判退"],
+    "特採": ["特採"],
+    # Assuming '允收' is a valid value for accepted
+    "允收": ["允收", "ok", "accept"],
+}
+
+# Special group alias for "defect" which maps to multiple values
+DEFECT_GROUP_ALIAS = {
+    "不良": ["不良", "ng", "不良批"],
+}
+
+# Reverse map for single aliases (lowered) -> canonical name
+DEFECT_ALIAS_TO_CN = {}
+for cn, aliases in DEFECT_ALIAS.items():
+    for a in aliases:
+        DEFECT_ALIAS_TO_CN[a.strip().lower()] = cn
+
+
+def normalize_defect_from_text(text: str) -> list[str] | None:
+    """Try find defect terms from user question text. Returns a list of canonical defect names."""
+    if not text:
+        return None
+    t = text.strip().lower()
+
+    # Check for group alias first, as it's more specific
+    for group_alias in DEFECT_GROUP_ALIAS["不良"]:
+        if group_alias in t:
+            return ["驗退", "特採"]  # "不良" means both rejected and special acceptance
+
+    # Check for individual aliases
+    found_defects = set()
+    for alias, cn in DEFECT_ALIAS_TO_CN.items():
+        if alias and alias in t:
+            found_defects.add(cn)
+
+    if found_defects:
+        return list(found_defects)
+
+    return None
+
 
 # =========================
 # Basic endpoints
@@ -237,9 +283,8 @@ def generate_sql(question: str) -> str:
         "只輸出一段可執行 SQL（不要解釋、不要 markdown）。"
         "限制：只允許 SELECT。"
         f"FROM 只能使用以下白名單：{', '.join(ALLOWED_FROM)}。"
-        "請特別注意：dbo.cqcr310 的 Plant 欄位資料值為中文（越南/昆山/增達），請在 SQL 中使用中文廠別。"
+        "請特別注意：1) Plant 欄位是中文（越南/昆山/增達）。 2) Inspection_Result 欄位也是中文（合格/特採/驗退），其中「不良」或「NG」代表 Inspection_Result 是 '特採' 或 '驗退'。"
         "若要近30天，請使用 SQL Server 語法：WHERE Inspection_Date >= DATEADD(day,-30, CAST(GETDATE() AS date))。"
-        "預設加上 TOP 50 限制避免資料過大。"
         "欄位已知：Plant, Inspection_Date, Product_Number, Product_Name, Supplier_Short_Name, "
         "Inspection_Item_Defect_Cause, Submitted_Quantity, Defect_Quantity, Sample_Size, Inspection_Result, Receiving_Number, Remark。"
         "常見需求：NG率=SUM(Defect_Quantity)/NULLIF(SUM(Submitted_Quantity),0)。"
