@@ -330,6 +330,8 @@ def generate_sql(question: str) -> str:
         process_rule = (
             "若在 dbo.csfr705 計算不良率，定義為 SUM(Defect_Quantity) * 1.0 / NULLIF(SUM(Inspection_Quantity), 0)。"
             "所有比率計算分子都要乘上 *1.0，避免整數除法。"
+            "「製程(csfr705) 不良率只能用 Defect_Quantity/Inspection_Quantity 定義；不得使用 Receiving_Number / Inspection_Result / 特採 / 驗退 的批次不良邏輯。」"
+            "「若問題包含『不良率』且 domain=process，預設輸出 SUM(Defect_Quantity)*1.0/NULLIF(SUM(Inspection_Quantity),0)。」"
         )
 
         if ctx["is_front_process"]:
@@ -563,3 +565,4 @@ async def line_webhook(req: Request):
             line_push(user_id, f"查詢失敗：{type(e).__name__}\n{msg[:350]}")
 
     return {"ok": True}
+
