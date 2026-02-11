@@ -22,9 +22,47 @@ PA_SQL_RUNNER_URL = os.getenv("PA_SQL_RUNNER_URL", "").strip()
 # 先放你已驗證 OK 的表；之後改 view / gold table 再加進來
 ALLOWED_FROM = [
     "dbo.cqcr310",
+    "dbo.csfr705",
 ]
 
 BANNED_SQL = re.compile(r"\b(insert|update|delete|drop|alter|create|truncate|merge)\b", re.IGNORECASE)
+
+
+# =========================
+# Query intent routing
+# =========================
+PROCESS_KEYWORDS = ["前製", "前製程", "後製", "後製程", "製程", "製程檢驗", "成品"]
+INCOMING_KEYWORDS = ["進料", "iqc", "來料", "收料", "收", "驗收", "incoming"]
+
+FRONT_PROCESS_KEYWORDS = ["前製", "前製程"]
+REAR_PROCESS_KEYWORDS = ["後製", "後製程", "成品"]
+
+
+def detect_query_context(question: str) -> dict:
+    q = (question or "").strip().lower()
+
+    is_process = any(k in q for k in PROCESS_KEYWORDS)
+    is_incoming = any(k in q for k in INCOMING_KEYWORDS)
+
+    # 如果使用者同時提到兩邊關鍵字，優先用製程（通常需求更明確）
+    if is_process:
+        table = "dbo.csfr705"
+        domain = "process"
+    elif is_incoming:
+        table = "dbo.cqcr310"
+        domain = "incoming"
+    else:
+        table = "dbo.cqcr310"
+        domain = "incoming"
+
+    return {
+        "domain": domain,
+        "table": table,
+        "is_front_process": any(k in q for k in FRONT_PROCESS_KEYWORDS),
+        "is_rear_process": any(k in q for k in REAR_PROCESS_KEYWORDS),
+        "ask_defect_rate": ("不良率" in q) or ("ng率" in q) or ("ng" in q),
+        "ask_defect_batch": ("不良批" in q) or ("不良批率" in q),
+    }
 
 
 
@@ -278,12 +316,45 @@ def strip_code_fence(s: str) -> str:
 
 
 def generate_sql(question: str) -> str:
+    ctx = detect_query_context(question)
+
+    domain_rule = (
+        "當問題是前製/後製/製程檢驗相關時，FROM 必須使用 dbo.csfr705；"
+        "當問題是進料/IQC/來料/驗收相關時，FROM 必須使用 dbo.cqcr310。"
+    )
+
+    table_rule = f"本題請固定使用 FROM {ctx['table']}。"
+
+    process_rule = ""
+    if ctx["domain"] == "process":
+        process_rule = (
+            "若在 dbo.csfr705 計算不良率，定義為 SUM(Defect_Quantity) * 1.0 / NULLIF(SUM(Inspection_Quantity), 0)。"
+            "所有比率計算分子都要乘上 *1.0，避免整數除法。"
+        )
+
+        if ctx["is_front_process"]:
+            process_rule += "前製/前製程代表 Process_Type IN (N'定子組立', N'定子電測')。"
+
+        if ctx["is_rear_process"]:
+            process_rule += "後製/後製程/成品代表 Process_Type IN (N'成品組立(DC)', N'成品組立(AC)', N'熱源成品')。"
+
+        if ctx["ask_defect_batch"]:
+            process_rule += (
+                "若問製程不良批：前製程以單筆不良率 > 0.01 視為不良批；"
+                "後製程以單筆不良率 > 0.03 視為不良批；"
+                "不良批率 = (不良批數 * 1.0) / NULLIF(COUNT(*), 0)，且一行視為一筆生產。"
+            )
+
     system = (
         "你是企業資料庫的 SQL 產生器。"
         "只輸出一段可執行 SQL（不要解釋、不要 markdown）。"
         "限制：只允許 SELECT。"
         f"FROM 只能使用以下白名單：{', '.join(ALLOWED_FROM)}。"
+        f"{domain_rule}"
+        f"{table_rule}"
         "請特別注意：1) Plant 欄位是中文（越南/昆山/增達）。 2) Inspection_Result 欄位也是中文（合格/特採/驗退），其中「不良」或「NG」代表 Inspection_Result 是 '特採' 或 '驗退'。"
+        "所有比率計算分子都要乘上 *1.0，避免整數除法。"
+        f"{process_rule}"
         "若要近30天，請使用 SQL Server 語法：WHERE Inspection_Date >= DATEADD(day,-30, CAST(GETDATE() AS date))。"
         "欄位已知：Plant, Inspection_Date, Product_Number, Product_Name, Supplier_Short_Name, "
         "Inspection_Item_Defect_Cause, Submitted_Quantity, Defect_Quantity, Sample_Size, Inspection_Result, Receiving_Number, Remark。"
