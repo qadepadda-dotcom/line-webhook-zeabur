@@ -25,7 +25,23 @@ ALLOWED_FROM = [
     "dbo.csfr705",
 ]
 
-BANNED_SQL = re.compile(r"\b(insert|update|delete|drop|alter|create|truncate|merge)\b", re.IGNORECASE)
+BANNED_SQL = re.compile(r"(insert|update|delete|drop|alter|create|truncate|merge)", re.IGNORECASE)
+
+
+# =========================
+# Table Schemas
+# =========================
+TABLE_SCHEMAS = {
+    "dbo.cqcr310": [
+        "Plant", "Inspection_Date", "Product_Number", "Product_Name", "Supplier_Short_Name",
+        "Inspection_Item_Defect_Cause", "Submitted_Quantity", "Defect_Quantity", "Sample_Size",
+        "Inspection_Result", "Receiving_Number", "Remark"
+    ],
+    "dbo.csfr705": [
+        "Plant", "Inspection_Date", "Product_Number", "Product_Name", "Process_Type",
+        "Inspection_Quantity", "Defect_Quantity", "Work_Order_Number"
+    ]
+}
 
 
 # =========================
@@ -317,21 +333,33 @@ def strip_code_fence(s: str) -> str:
 
 def generate_sql(question: str) -> str:
     ctx = detect_query_context(question)
+    table = ctx["table"]
+
+    # Get table-specific schemas and hints
+    columns = TABLE_SCHEMAS.get(table, [])
+    column_rule = f"欄位已知：{', '.join(columns)}。" if columns else ""
 
     domain_rule = (
         "當問題是前製/後製/製程檢驗相關時，FROM 必須使用 dbo.csfr705；"
         "當問題是進料/IQC/來料/驗收相關時，FROM 必須使用 dbo.cqcr310。"
     )
 
-    table_rule = f"本題請固定使用 FROM {ctx['table']}。"
+    table_rule = f"本題請固定使用 FROM {table}。"
+
+    # Specific hints for incoming inspection table
+    incoming_hint = ""
+    if table == "dbo.cqcr310":
+        incoming_hint = (
+            "常見需求：不良批率、NG率= NULLIF(不良批,0)/NULLIF(檢驗批,0)。「批」的計算方式是 COUNT(Receiving_Number)。"
+            "例如「檢驗批」= COUNT(Receiving_Number)，「不良批」= COUNT(CASE WHEN Inspection_Result IN ('特採', '驗退') THEN Receiving_Number END)。"
+            "另外，Inspection_Result 欄位是中文（合格/特採/驗退），其中「不良」或「NG」代表 Inspection_Result 是 '特採' 或 '驗退'。"
+        )
 
     process_rule = ""
     if ctx["domain"] == "process":
         process_rule = (
             "若在 dbo.csfr705 計算不良率，定義為 SUM(Defect_Quantity) * 1.0 / NULLIF(SUM(Inspection_Quantity), 0)。"
             "所有比率計算分子都要乘上 *1.0，避免整數除法。"
-            "「製程(csfr705) 不良率只能用 Defect_Quantity/Inspection_Quantity 定義；不得使用 Receiving_Number / Inspection_Result / 特採 / 驗退 的批次不良邏輯。」"
-            "「若問題包含『不良率』且 domain=process，預設輸出 SUM(Defect_Quantity)*1.0/NULLIF(SUM(Inspection_Quantity),0)。」"
         )
 
         if ctx["is_front_process"]:
@@ -354,13 +382,12 @@ def generate_sql(question: str) -> str:
         f"FROM 只能使用以下白名單：{', '.join(ALLOWED_FROM)}。"
         f"{domain_rule}"
         f"{table_rule}"
-        "請特別注意：1) Plant 欄位是中文（越南/昆山/增達）。 2) Inspection_Result 欄位也是中文（合格/特採/驗退），其中「不良」或「NG」代表 Inspection_Result 是 '特採' 或 '驗退'。"
+        "請特別注意：Plant 欄位是中文（越南/昆山/增達）。"
         "所有比率計算分子都要乘上 *1.0，避免整數除法。"
+        f"{column_rule}"
         f"{process_rule}"
+        f"{incoming_hint}"
         "若要近30天，請使用 SQL Server 語法：WHERE Inspection_Date >= DATEADD(day,-30, CAST(GETDATE() AS date))。"
-        "欄位已知：Plant, Inspection_Date, Product_Number, Product_Name, Supplier_Short_Name, "
-        "Inspection_Item_Defect_Cause, Submitted_Quantity, Defect_Quantity, Sample_Size, Inspection_Result, Receiving_Number, Remark。"
-        "常見需求：不良批率、NG率= NULLIF(不良批,0)/NULLIF(檢驗批,0)。「批」的計算方式是 COUNT(Receiving_Number)。例如「檢驗批」= COUNT(Receiving_Number)，「不良批」= COUNT(CASE WHEN Inspection_Result IN ('特採', '驗退') THEN Receiving_Number END)。"
         "請優先回傳可用於管理者查看的 Top N 結果（ORDER BY ... DESC）。"
     )
     user = f"問題：{question}\n請輸出 SQL："
@@ -565,4 +592,3 @@ async def line_webhook(req: Request):
             line_push(user_id, f"查詢失敗：{type(e).__name__}\n{msg[:350]}")
 
     return {"ok": True}
-
