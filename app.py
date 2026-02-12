@@ -397,6 +397,7 @@ def generate_sql(question: str) -> str:
         "Your task is to generate a single, executable SQL SELECT statement based on the user's question. Do not provide any explanation or markdown formatting.\n"
         "--- General Rules ---\n"
         "- The database is SQL Server.\n"
+        "如果問到跟製程有關的內容，時間請一律使用Production_Date. \n"
         "- Only SELECT statements are allowed.\n"
         f"- You must only query from the following whitelisted tables: {', '.join(ALLOWED_FROM)}.\n"
         f"- The `Plant` column always contains Chinese values (越南/昆山/增達). Your query must use these Chinese values in WHERE clauses, e.g., `Plant = N'越南'`.\n"
