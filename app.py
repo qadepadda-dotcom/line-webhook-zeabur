@@ -38,8 +38,8 @@ TABLE_SCHEMAS = {
         "Inspection_Result", "Receiving_Number", "Remark"
     ],
     "dbo.csfr705": [
-        "Plant", "Inspection_Date", "Product_Number", "Product_Name", "Process_Type",
-        "Inspection_Quantity", "Defect_Quantity", "Work_Order_Number"
+        "Plant", "Production_Date", "Product_Number", "Product_Name", "Process_Type",
+        "Inspection_Quantity", "Defect_Quantity", "Work_Order_Number","Work_Order_Quantity","Defect_Category_Major"
     ]
 }
 
