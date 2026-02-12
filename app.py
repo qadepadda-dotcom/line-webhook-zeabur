@@ -25,22 +25,39 @@ ALLOWED_FROM = [
     "dbo.csfr705",
 ]
 
-BANNED_SQL = re.compile(r"(insert|update|delete|drop|alter|create|truncate|merge)", re.IGNORECASE)
+BANNED_SQL = re.compile(r"\b(insert|update|delete|drop|alter|create|truncate|merge)\b", re.IGNORECASE)
 
 
 # =========================
-# Table Schemas
+# Table Configuration
 # =========================
-TABLE_SCHEMAS = {
-    "dbo.cqcr310": [
-        "Plant", "Inspection_Date", "Product_Number", "Product_Name", "Supplier_Short_Name",
-        "Inspection_Item_Defect_Cause", "Submitted_Quantity", "Defect_Quantity", "Sample_Size",
-        "Inspection_Result", "Receiving_Number", "Remark"
-    ],
-    "dbo.csfr705": [
-        "Plant", "Production_Date", "Product_Number", "Product_Name", "Process_Type",
-        "Inspection_Quantity", "Defect_Quantity", "Work_Order_Number","Work_Order_Quantity","Defect_Category_Major"
-    ]
+TABLE_CONFIG = {
+    "dbo.cqcr310": {
+        "schema": [
+            "Plant", "Inspection_Date", "Product_Number", "Product_Name", "Supplier_Short_Name",
+            "Inspection_Item_Defect_Cause", "Submitted_Quantity", "Defect_Quantity", "Sample_Size",
+            "Inspection_Result", "Receiving_Number", "Remark"
+        ],
+        "date_column": "Inspection_Date",
+        "hints": [
+            "This table is for incoming goods inspection (IQC).",
+            "To calculate the defect batch rate, count batches (Receiving_Number) where Inspection_Result is '特採' (special acceptance) or '驗退' (rejection).",
+            "A 'batch' is identified by `Receiving_Number`. For example, `COUNT(DISTINCT Receiving_Number)` gives the number of batches.",
+            "The `Inspection_Result` column contains Chinese values: '合格' (pass), '特採' (special acceptance), '驗退' (rejection).",
+            "The term '不良' (defect/NG) corresponds to an `Inspection_Result` of '特採' or '驗退'."
+        ]
+    },
+    "dbo.csfr705": {
+        "schema": [
+            "Plant", "Production_Date", "Product_Number", "Product_Name", "Process_Type",
+            "Inspection_Quantity", "Defect_Quantity", "Work_Order_Number", "Work_Order_Quantity", "Defect_Category_Major"
+        ],
+        "date_column": "Production_Date",
+        "hints": [
+            "This table is for in-process inspection (IPQC) for front-end and rear-end manufacturing.",
+            "The defect rate for a process is `SUM(Defect_Quantity) * 1.0 / NULLIF(SUM(Inspection_Quantity), 0)`."
+        ]
+    }
 }
 
 
@@ -335,62 +352,65 @@ def generate_sql(question: str) -> str:
     ctx = detect_query_context(question)
     table = ctx["table"]
 
-    # Get table-specific schemas and hints
-    columns = TABLE_SCHEMAS.get(table, [])
-    column_rule = f"欄位已知：{', '.join(columns)}。" if columns else ""
+    # Get table-specific config
+    config = TABLE_CONFIG.get(table, {})
 
+    # Build rules from config
+    columns = config.get("schema", [])
+    column_rule = f"The user is querying the `{table}` table. Its available columns are: {', '.join(columns)}." if columns else ""
+
+    date_column = config.get("date_column")
+    date_hint = ""
+    if date_column:
+        date_hint = f"For any date filtering on `{table}`, you must use the `{date_column}` column. For example, to get data from the last 30 days, use: `WHERE {date_column} >= DATEADD(day, -30, CAST(GETDATE() AS date))`."
+
+    # Join other static hints from config
+    other_hints = "\n".join(f"- {hint}" for hint in config.get("hints", []))
+    hints_section = f"Specific rules and hints for the `{table}` table:\n{other_hints}" if other_hints else ""
+
+    # General rules that apply to all queries
     domain_rule = (
-        "當問題是前製/後製/製程檢驗相關時，FROM 必須使用 dbo.csfr705；"
-        "當問題是進料/IQC/來料/驗收相關時，FROM 必須使用 dbo.cqcr310。"
+        "High-level routing: if the question is about '前製/後製/製程檢驗' (in-process), use `dbo.csfr705`; "
+        "if it's about '進料/IQC/來料' (incoming inspection), use `dbo.cqcr310`."
     )
+    table_rule = f"For this specific question, you must query from the `{table}` table."
 
-    table_rule = f"本題請固定使用 FROM {table}。"
-
-    # Specific hints for incoming inspection table
-    incoming_hint = ""
-    if table == "dbo.cqcr310":
-        incoming_hint = (
-            "常見需求：不良批率、NG率= NULLIF(不良批,0)/NULLIF(檢驗批,0)。「批」的計算方式是 COUNT(Receiving_Number)。"
-            "例如「檢驗批」= COUNT(Receiving_Number)，「不良批」= COUNT(CASE WHEN Inspection_Result IN ('特採', '驗退') THEN Receiving_Number END)。"
-            "另外，Inspection_Result 欄位是中文（合格/特採/驗退），其中「不良」或「NG」代表 Inspection_Result 是 '特採' 或 '驗退'。"
-        )
-
+    # Dynamic rules based on question context (specific to 'process' domain for now)
     process_rule = ""
     if ctx["domain"] == "process":
-        process_rule = (
-            "若在 dbo.csfr705 計算不良率，定義為 SUM(Defect_Quantity) * 1.0 / NULLIF(SUM(Inspection_Quantity), 0)。"
-            "所有比率計算分子都要乘上 *1.0，避免整數除法。"
-        )
-
+        process_rule_parts = [
+            "The overall defect rate is calculated as: `SUM(Defect_Quantity) * 1.0 / NULLIF(SUM(Inspection_Quantity), 0)`."
+        ]
         if ctx["is_front_process"]:
-            process_rule += "前製/前製程代表 Process_Type IN (N'定子組立', N'定子電測')。"
-
+            process_rule_parts.append("The keywords '前製/前製程' (front-end process) mean `Process_Type IN (N'定子組立', N'定子電測')`.")
         if ctx["is_rear_process"]:
-            process_rule += "後製/後製程/成品代表 Process_Type IN (N'成品組立(DC)', N'成品組立(AC)', N'熱源成品')。"
-
+            process_rule_parts.append("The keywords '後製/後製程/成品' (rear-end process) mean `Process_Type IN (N'成品組立(DC)', N'成品組立(AC)', N'熱源成品')`.")
         if ctx["ask_defect_batch"]:
-            process_rule += (
-                "若問製程不良批：前製程以單筆不良率 > 0.01 視為不良批；"
-                "後製程以單筆不良率 > 0.03 視為不良批；"
-                "不良批率 = (不良批數 * 1.0) / NULLIF(COUNT(*), 0)，且一行視為一筆生產。"
+            process_rule_parts.append(
+                "A 'defect batch' in a process context is defined by its single-batch defect rate. For front-end processes, a batch is defective if its rate > 0.01. For rear-end processes, if its rate > 0.03. The defect batch rate is `(count of defect batches * 1.0) / (total count of batches)`."
             )
+        process_rule = "Dynamic rules for this 'process' query:\n" + "\n".join(f"- {part}" for part in process_rule_parts)
+
 
     system = (
-        "你是企業資料庫的 SQL 產生器。"
-        "只輸出一段可執行 SQL（不要解釋、不要 markdown）。"
-        "限制：只允許 SELECT。"
-        f"FROM 只能使用以下白名單：{', '.join(ALLOWED_FROM)}。"
-        f"{domain_rule}"
-        f"{table_rule}"
-        "請特別注意：Plant 欄位是中文（越南/昆山/增達）。"
-        "所有比率計算分子都要乘上 *1.0，避免整數除法。"
-        f"{column_rule}"
+        "You are an expert SQL generator for a corporate database.\n"
+        "Your task is to generate a single, executable SQL SELECT statement based on the user's question. Do not provide any explanation or markdown formatting.\n"
+        "--- General Rules ---\n"
+        "- The database is SQL Server.\n"
+        "- Only SELECT statements are allowed.\n"
+        f"- You must only query from the following whitelisted tables: {', '.join(ALLOWED_FROM)}.\n"
+        f"- The `Plant` column always contains Chinese values (越南/昆山/增達). Your query must use these Chinese values in WHERE clauses, e.g., `Plant = N'越南'`.\n"
+        "- When calculating rates or percentages, multiply the numerator by `1.0` to ensure floating-point division.\n"
+        "- Prioritize returning Top N results that would be most useful for a manager (e.g., ORDER BY a key metric DESC).\n"
+        "--- Query-Specific Context ---\n"
+        f"{domain_rule}\n"
+        f"{table_rule}\n"
+        f"{column_rule}\n"
+        f"{date_hint}\n"
+        f"{hints_section}\n"
         f"{process_rule}"
-        f"{incoming_hint}"
-        "若要近30天，請使用 SQL Server 語法：WHERE Inspection_Date >= DATEADD(day,-30, CAST(GETDATE() AS date))。"
-        "請優先回傳可用於管理者查看的 Top N 結果（ORDER BY ... DESC）。"
     )
-    user = f"問題：{question}\n請輸出 SQL："
+    user = f"User question: {question}\nGenerate the SQL query:"
     sql = call_openai([{"role": "system", "content": system}, {"role": "user", "content": user}]).strip()
     sql = strip_code_fence(sql)
     return sql.strip().strip(";")
